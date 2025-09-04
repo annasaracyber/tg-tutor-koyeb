@@ -1,11 +1,11 @@
-
 import os, re, asyncio, logging
 from typing import List, Optional
 from fastapi import FastAPI
 from telethon import events
 from telethon.sessions import StringSession
 from telethon import TelegramClient
-import uvicorn  # <-- добавили
+import uvicorn
+from datetime import datetime, timedelta, timezone  # для бэскана истории
 
 # ---------- настройки через окружение ----------
 API_ID = int(os.environ["API_ID"])           # число с my.telegram.org
@@ -83,12 +83,64 @@ async def resolve_entities():
 def public_link(username: Optional[str], mid: int) -> str:
     return f"https://t.me/{username}/{mid}" if username else ""
 
+# ---------- сканирование истории ----------
+async def scan_recent(days: int = 4, max_per_chat: int = 2000) -> int:
+    """
+    Пройтись по чатам/каналам и найти сообщения за последние `days` дней,
+    похожие на запрос репетитора. Возвращает число совпадений.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # набираем список сущностей для прохода
+    entities = []
+    if allowed_chat_ids is None:
+        async for d in client.iter_dialogs():
+            if getattr(d, "is_group", False) or getattr(d, "is_channel", False):
+                entities.append(d.entity)
+    else:
+        for cid in allowed_chat_ids:
+            try:
+                entities.append(await client.get_entity(cid))
+            except Exception as e:
+                logger.warning(f"Не удалось получить entity {cid}: {e}")
+
+    total = 0
+    for ent in entities:
+        title = getattr(ent, "title", getattr(ent, "username", None)) or str(getattr(ent, "id", ""))
+        username = getattr(ent, "username", None)
+
+        async for m in client.iter_messages(ent, limit=max_per_chat):
+            if not m or not m.date:
+                continue
+            if m.date < cutoff:
+                break  # дальше сообщения ещё старше
+
+            text = m.message or ""
+            if not looks_like_request(text):
+                continue
+
+            link = public_link(username, m.id)
+            msg = (
+                "🔎 (история) Запрос репетитора по английскому\n"
+                f"👥 Чат: {title}\n"
+                f"🧷 Сообщение #{m.id}\n"
+                f"🕒 {m.date.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
+                f"🔗 {link or '(приватный чат)'}\n\n"
+                f"{norm(text)}"
+            )
+            await client.send_message("me", msg)
+            total += 1
+            await asyncio.sleep(0.2)  # щадим лимиты
+
+    logger.info(f"[SCAN] Найдено совпадений: {total} (за {days} дн.)")
+    return total
+
 @app.on_event("startup")
 async def on_startup():
     await client.start()
     await resolve_entities()
 
-    # без параметра chats — фильтруем вручную по allowed_chat_ids
+    # обработчик новых сообщений (онлайн-режим)
     @client.on(events.NewMessage)
     async def handler(event):
         try:
@@ -116,9 +168,12 @@ async def on_startup():
         except Exception as e:
             logger.exception(f"Ошибка обработчика: {e}")
 
-    # важный момент: в фоне, чтобы FastAPI не блокировался
+    # Telethon в фоне
     asyncio.create_task(client.run_until_disconnected())
     logger.info("Клиент Telegram запущен.")
+
+    # разовый бэскан истории за последние 4 дня при старте
+    asyncio.create_task(scan_recent(days=4))
 
 @app.get("/")
 async def root():
@@ -129,6 +184,6 @@ async def health():
     return {"ok": True}
 
 if __name__ == "__main__":
-    # Render задаёт PORT; по умолчанию 10000 (их рекомендация)
+    # Render задаёт PORT; по умолчанию 10000
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
