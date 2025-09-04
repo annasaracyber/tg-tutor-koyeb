@@ -4,38 +4,34 @@ from fastapi import FastAPI
 from telethon import events
 from telethon.sessions import StringSession
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError  # <-- важно: ловим лимиты Telegram
 import uvicorn
-from datetime import datetime, timedelta, timezone  # для бэскана истории
 
 # ---------- настройки через окружение ----------
-API_ID = int(os.environ["API_ID"])           # число с my.telegram.org
-API_HASH = os.environ["API_HASH"]            # строка с my.telegram.org
-TG_STRING_SESSION = os.environ["TG_STRING_SESSION"]  # твой длинный ключ
-CHANNELS = os.getenv("CHANNELS", "").strip() # список через запятую: @chat1,@chat2
-MINUS_WORDS = os.getenv("MINUS_WORDS", "")   # минус-слова через запятую (например: "школа,класс,обед,столовая,домашка,ученик,директор")
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+TG_STRING_SESSION = os.environ["TG_STRING_SESSION"]
+CHANNELS = os.getenv("CHANNELS", "").strip()
+MINUS_WORDS = os.getenv("MINUS_WORDS", "")
 
 # ---------- ключевые группы ----------
 LANG_PATTERNS = [
-    # английский
     r"\bанглийск\w*\b", r"\bангл\b", r"\benglish\b", r"\bIELTS\b", r"\bTOEFL\b",
-    # испанский
     r"\bиспанск\w*\b", r"\bspanish\b", r"\bDELE\b",
-    # итальянский
     r"\bитальянск\w*\b", r"\bitalian\b", r"\bCELI\b", r"\bCILS\b",
-    # китайский
     r"\bкитайск\w*\b", r"\bchinese\b", r"\bHSK\b",
 ]
 
 ROLE_PATTERNS = [
     r"\bрепетитор\w*\b",
     r"\bпреподавател[ья]\w*\b",
-    r"\bучител[ья]\w*\b",  # оставим, но оно само по себе не триггерит без языка + намерения
+    r"\bучител[ья]\w*\b",
 ]
 
 SCHOOL_PATTERNS = [
     r"\bонлайн[- ]?школ\w*\b",
     r"\bкурсы?\b", r"\bзанятия\b", r"\bурок(?:и|ов)?\b",
-    r"\bподготовк\w*\b",  # подготовка к экзаменам и т.п.
+    r"\bподготовк\w*\b",
 ]
 
 HINT_PATTERNS = [
@@ -47,13 +43,11 @@ HINT_PATTERNS = [
 def _rx_or(parts: List[str]) -> re.Pattern:
     return re.compile("|".join(parts), re.IGNORECASE | re.MULTILINE) if parts else re.compile(r"^\b$")
 
-# компилированные регэкспы
 RX_LANG   = _rx_or(LANG_PATTERNS)
 RX_ROLE   = _rx_or(ROLE_PATTERNS)
 RX_SCHOOL = _rx_or(SCHOOL_PATTERNS)
 RX_HINT   = _rx_or(HINT_PATTERNS)
 
-# минус-слова из окружения
 MINUS = [w.strip() for w in MINUS_WORDS.split(",") if w.strip()]
 RX_MINUS = _rx_or([re.escape(w) for w in MINUS]) if MINUS else None
 
@@ -61,26 +55,15 @@ def norm(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\u200b", "")).strip()
 
 def looks_like_request(text: str) -> bool:
-    """
-    Жёсткий фильтр:
-    - обязательно есть один из языков (RX_LANG)
-    - и (роль репетитора/препода ИЛИ школа/курсы)  => RX_ROLE or RX_SCHOOL
-    - и выражена интенция (RX_HINT ИЛИ вопросительный знак/слова-триггеры)
-    - не содержит минус-слов
-    """
     t = norm(text)
     if not t:
         return False
     if RX_MINUS and RX_MINUS.search(t):
         return False
-
     if not RX_LANG.search(t):
         return False
-
-    has_role_or_school = bool(RX_ROLE.search(t) or RX_SCHOOL.search(t))
-    if not has_role_or_school:
+    if not (RX_ROLE.search(t) or RX_SCHOOL.search(t)):
         return False
-
     hinted = bool(
         RX_HINT.search(t) or
         re.search(r"[?]|подскажите|посоветуйте|ищу|нужен|нужна|нужно|порекоменд(уй|уйте)", t, re.IGNORECASE)
@@ -94,18 +77,14 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn")
 
-# будем хранить разрешённые chat_id (если CHANNELS пустой — слушаем все)
 allowed_chat_ids: Optional[set[int]] = None
 
 async def resolve_entities():
-    """Заполняем allowed_chat_ids из переменной CHANNELS.
-    Если CHANNELS пуст — слушаем все чаты."""
     global allowed_chat_ids
     if not CHANNELS:
         allowed_chat_ids = None
         logger.info("Слушаем: ВСЕ чаты (CHANNELS пустой)")
         return
-
     names = [x.strip() for x in CHANNELS.split(",") if x.strip()]
     ids = set()
     for name in names:
@@ -120,64 +99,37 @@ async def resolve_entities():
 def public_link(username: Optional[str], mid: int) -> str:
     return f"https://t.me/{username}/{mid}" if username else ""
 
-# ---------- сканирование истории ----------
-async def scan_recent(days: int = 4, max_per_chat: int = 2000) -> int:
-    """
-    Пройтись по чатам/каналам и найти сообщения за последние `days` дней,
-    похожие на запрос репетитора. Возвращает число совпадений.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+# ---------- безопасная отправка в Избранное ----------
+# (ограничим частоту, обработаем FloodWait и непредвиденные ошибки)
+_send_lock = asyncio.Lock()  # простая серилизация отправок
 
-    # набираем список сущностей для прохода
-    entities = []
-    if allowed_chat_ids is None:
-        async for d in client.iter_dialogs():
-            if getattr(d, "is_group", False) or getattr(d, "is_channel", False):
-                entities.append(d.entity)
-    else:
-        for cid in allowed_chat_ids:
+async def safe_send_to_saved(text: str, max_retries: int = 5):
+    attempt = 0
+    async with _send_lock:  # по одному сообщению за раз
+        while True:
             try:
-                entities.append(await client.get_entity(cid))
+                res = await client.send_message("me", text)
+                # лёгкий троттлинг между отправками
+                await asyncio.sleep(0.4)
+                return res
+            except FloodWaitError as e:
+                wait_s = int(getattr(e, "seconds", 1)) or 1
+                logger.warning(f"[FLOOD] Telegram просит подождать {wait_s}s — ждём…")
+                await asyncio.sleep(wait_s + 1)
             except Exception as e:
-                logger.warning(f"Не удалось получить entity {cid}: {e}")
-
-    total = 0
-    for ent in entities:
-        title = getattr(ent, "title", getattr(ent, "username", None)) or str(getattr(ent, "id", ""))
-        username = getattr(ent, "username", None)
-
-        async for m in client.iter_messages(ent, limit=max_per_chat):
-            if not m or not m.date:
-                continue
-            if m.date < cutoff:
-                break  # дальше сообщения ещё старше
-
-            text = m.message or ""
-            if not looks_like_request(text):
-                continue
-
-            link = public_link(username, m.id)
-            msg = (
-                "🔎 (история) Запрос репетитора по языкам\n"
-                f"👥 Чат: {title}\n"
-                f"🧷 Сообщение #{m.id}\n"
-                f"🕒 {m.date.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
-                f"🔗 {link or '(приватный чат)'}\n\n"
-                f"{norm(text)}"
-            )
-            await client.send_message("me", msg)
-            total += 1
-            await asyncio.sleep(0.2)  # щадим лимиты
-
-    logger.info(f"[SCAN] Найдено совпадений: {total} (за {days} дн.)")
-    return total
+                attempt += 1
+                if attempt >= max_retries:
+                    logger.exception(f"[SEND FAIL] Не удалось отправить после {attempt} попыток: {e}")
+                    return None
+                backoff = 2 * attempt
+                logger.warning(f"[SEND RETRY] Ошибка отправки, пробуем через {backoff}s: {e}")
+                await asyncio.sleep(backoff)
 
 @app.on_event("startup")
 async def on_startup():
     await client.start()
     await resolve_entities()
 
-    # обработчик новых сообщений (онлайн-режим)
     @client.on(events.NewMessage)
     async def handler(event):
         try:
@@ -194,23 +146,19 @@ async def on_startup():
             link = public_link(username, event.id)
 
             msg = (
-                "🔎 Запрос репетитора по языкам\n"
+                "🔎 (новое) Запрос репетитора по языкам\n"
                 f"👥 Чат: {title}\n"
                 f"🧷 Сообщение #{event.id}\n"
                 f"🔗 {link or '(приватный чат)'}\n\n"
                 f"{norm(text)}"
             )
-            await client.send_message("me", msg)
+            await safe_send_to_saved(msg)
             logger.info(f"[MATCH] {title} #{event.id} | {norm(text)[:120]}")
         except Exception as e:
             logger.exception(f"Ошибка обработчика: {e}")
 
-    # Telethon в фоне
     asyncio.create_task(client.run_until_disconnected())
     logger.info("Клиент Telegram запущен.")
-
-    # разовый бэскан истории за последние 4 дня при старте
-    asyncio.create_task(scan_recent(days=4))
 
 @app.get("/")
 async def root():
@@ -221,6 +169,5 @@ async def health():
     return {"ok": True}
 
 if __name__ == "__main__":
-    # Render задаёт PORT; по умолчанию 10000
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
