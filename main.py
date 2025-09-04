@@ -161,10 +161,12 @@ async def on_startup():
     logger.info("Клиент Telegram запущен.")
 
 @app.get("/")
+@app.head("/")
 async def root():
     return {"status": "ok"}
 
 @app.get("/health")
+@app.head("/health")
 async def health():
     return {"ok": True}
 
