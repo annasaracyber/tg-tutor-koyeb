@@ -1,9 +1,11 @@
+
 import os, re, asyncio, logging
 from typing import List, Optional
 from fastapi import FastAPI
 from telethon import events
 from telethon.sessions import StringSession
 from telethon import TelegramClient
+import uvicorn  # <-- добавили
 
 # ---------- настройки через окружение ----------
 API_ID = int(os.environ["API_ID"])           # число с my.telegram.org
@@ -52,8 +54,8 @@ def looks_like_request(text: str) -> bool:
 client = TelegramClient(StringSession(TG_STRING_SESSION), API_ID, API_HASH)
 
 app = FastAPI()
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn")
-logger.setLevel(logging.INFO)
 
 # будем хранить разрешённые chat_id (если CHANNELS пустой — слушаем все)
 allowed_chat_ids: Optional[set[int]] = None
@@ -86,7 +88,7 @@ async def on_startup():
     await client.start()
     await resolve_entities()
 
-    # ВАЖНО: без параметра chats — отфильтруем вручную по allowed_chat_ids
+    # без параметра chats — фильтруем вручную по allowed_chat_ids
     @client.on(events.NewMessage)
     async def handler(event):
         try:
@@ -114,6 +116,7 @@ async def on_startup():
         except Exception as e:
             logger.exception(f"Ошибка обработчика: {e}")
 
+    # важный момент: в фоне, чтобы FastAPI не блокировался
     asyncio.create_task(client.run_until_disconnected())
     logger.info("Клиент Telegram запущен.")
 
@@ -124,3 +127,8 @@ async def root():
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+if __name__ == "__main__":
+    # Render задаёт PORT; по умолчанию 10000 (их рекомендация)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
