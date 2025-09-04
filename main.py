@@ -12,28 +12,48 @@ API_ID = int(os.environ["API_ID"])           # число с my.telegram.org
 API_HASH = os.environ["API_HASH"]            # строка с my.telegram.org
 TG_STRING_SESSION = os.environ["TG_STRING_SESSION"]  # твой длинный ключ
 CHANNELS = os.getenv("CHANNELS", "").strip() # список через запятую: @chat1,@chat2
-MINUS_WORDS = os.getenv("MINUS_WORDS", "")   # минус-слова через запятую
+MINUS_WORDS = os.getenv("MINUS_WORDS", "")   # минус-слова через запятую (например: "школа,класс,обед,столовая,домашка,ученик,директор")
 
-# ключевые слова и "подсказки"
-KEYWORDS = [
-    r"\bрепетитор[а-я]*\b", r"\bпреподавател[ья][а-я]*\b", r"\bучител[ья][а-я]*\b",
-    r"\bзанятия по англ[а-я]*\b", r"\bанглийск(ий|ого|им|ом|ие)\b", r"\bангл\b",
-    r"\bIELTS\b", r"\bTOEFL\b", r"\btutor\b", r"\bteacher\b", r"\benglish\b",
+# ---------- ключевые группы ----------
+LANG_PATTERNS = [
+    # английский
+    r"\bанглийск\w*\b", r"\bангл\b", r"\benglish\b", r"\bIELTS\b", r"\bTOEFL\b",
+    # испанский
+    r"\bиспанск\w*\b", r"\bspanish\b", r"\bDELE\b",
+    # итальянский
+    r"\bитальянск\w*\b", r"\bitalian\b", r"\bCELI\b", r"\bCILS\b",
+    # китайский
+    r"\bкитайск\w*\b", r"\bchinese\b", r"\bHSK\b",
 ]
-HINTS = [
-    r"\bпорекомендуйте\b", r"\bможете ли порекомендовать\b",
-    r"\bнужен(а|о)? репетитор\b", r"\bищу репетитора\b",
-    r"\bкто может посоветовать\b",
-    r"\brecommend( an? )?english (tutor|teacher)\b",
-    r"\bIELTS (coach|tutor|teacher)\b",
+
+ROLE_PATTERNS = [
+    r"\bрепетитор\w*\b",
+    r"\bпреподавател[ья]\w*\b",
+    r"\bучител[ья]\w*\b",  # оставим, но оно само по себе не триггерит без языка + намерения
+]
+
+SCHOOL_PATTERNS = [
+    r"\bонлайн[- ]?школ\w*\b",
+    r"\bкурсы?\b", r"\bзанятия\b", r"\bурок(?:и|ов)?\b",
+    r"\bподготовк\w*\b",  # подготовка к экзаменам и т.п.
+]
+
+HINT_PATTERNS = [
+    r"\bищу\b", r"\bнужен\b", r"\bнужна\b", r"\bнужно\b",
+    r"\bпорекомендуйте\b", r"\bпосоветуйте\b", r"\bкто\s+может\s+посоветовать\b",
+    r"\brecommend\b", r"\blooking\s+for\b", r"\bneed\b",
 ]
 
 def _rx_or(parts: List[str]) -> re.Pattern:
     return re.compile("|".join(parts), re.IGNORECASE | re.MULTILINE) if parts else re.compile(r"^\b$")
 
-RX_KEY = _rx_or(KEYWORDS)
-RX_HINT = _rx_or(HINTS)
+# компилированные регэкспы
+RX_LANG   = _rx_or(LANG_PATTERNS)
+RX_ROLE   = _rx_or(ROLE_PATTERNS)
+RX_SCHOOL = _rx_or(SCHOOL_PATTERNS)
+RX_HINT   = _rx_or(HINT_PATTERNS)
 
+# минус-слова из окружения
 MINUS = [w.strip() for w in MINUS_WORDS.split(",") if w.strip()]
 RX_MINUS = _rx_or([re.escape(w) for w in MINUS]) if MINUS else None
 
@@ -41,14 +61,31 @@ def norm(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\u200b", "")).strip()
 
 def looks_like_request(text: str) -> bool:
+    """
+    Жёсткий фильтр:
+    - обязательно есть один из языков (RX_LANG)
+    - и (роль репетитора/препода ИЛИ школа/курсы)  => RX_ROLE or RX_SCHOOL
+    - и выражена интенция (RX_HINT ИЛИ вопросительный знак/слова-триггеры)
+    - не содержит минус-слов
+    """
     t = norm(text)
-    if not t or not RX_KEY.search(t):
+    if not t:
         return False
     if RX_MINUS and RX_MINUS.search(t):
         return False
-    if RX_HINT.search(t):
-        return True
-    return bool(re.search(r"[?]|подскажите|посоветуйте|ищу|нужен|где найти", t, re.IGNORECASE))
+
+    if not RX_LANG.search(t):
+        return False
+
+    has_role_or_school = bool(RX_ROLE.search(t) or RX_SCHOOL.search(t))
+    if not has_role_or_school:
+        return False
+
+    hinted = bool(
+        RX_HINT.search(t) or
+        re.search(r"[?]|подскажите|посоветуйте|ищу|нужен|нужна|нужно|порекоменд(уй|уйте)", t, re.IGNORECASE)
+    )
+    return hinted
 
 # ---------- Telegram client ----------
 client = TelegramClient(StringSession(TG_STRING_SESSION), API_ID, API_HASH)
@@ -121,7 +158,7 @@ async def scan_recent(days: int = 4, max_per_chat: int = 2000) -> int:
 
             link = public_link(username, m.id)
             msg = (
-                "🔎 (история) Запрос репетитора по английскому\n"
+                "🔎 (история) Запрос репетитора по языкам\n"
                 f"👥 Чат: {title}\n"
                 f"🧷 Сообщение #{m.id}\n"
                 f"🕒 {m.date.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
@@ -157,7 +194,7 @@ async def on_startup():
             link = public_link(username, event.id)
 
             msg = (
-                "🔎 Запрос репетитора по английскому\n"
+                "🔎 Запрос репетитора по языкам\n"
                 f"👥 Чат: {title}\n"
                 f"🧷 Сообщение #{event.id}\n"
                 f"🔗 {link or '(приватный чат)'}\n\n"
