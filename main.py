@@ -55,24 +55,28 @@ app = FastAPI()
 logger = logging.getLogger("uvicorn")
 logger.setLevel(logging.INFO)
 
-entities_cache = None  # список сущностей чатов для фильтра
+# будем хранить разрешённые chat_id (если CHANNELS пустой — слушаем все)
+allowed_chat_ids: Optional[set[int]] = None
 
 async def resolve_entities():
-    global entities_cache
+    """Заполняем allowed_chat_ids из переменной CHANNELS.
+    Если CHANNELS пуст — слушаем все чаты."""
+    global allowed_chat_ids
     if not CHANNELS:
-        entities_cache = None  # слушать все диалоги
+        allowed_chat_ids = None
         logger.info("Слушаем: ВСЕ чаты (CHANNELS пустой)")
         return
+
     names = [x.strip() for x in CHANNELS.split(",") if x.strip()]
-    ents = []
+    ids = set()
     for name in names:
         try:
             ent = await client.get_entity(name)
-            ents.append(ent)
+            ids.add(getattr(ent, "id", None))
         except Exception as e:
             logger.warning(f"Не удалось получить {name}: {e}")
-    entities_cache = ents
-    logger.info(f"Слушаем чаты/каналы: {len(ents)}")
+    allowed_chat_ids = {i for i in ids if i is not None}
+    logger.info(f"Слушаем чаты/каналы: {len(allowed_chat_ids)}")
 
 def public_link(username: Optional[str], mid: int) -> str:
     return f"https://t.me/{username}/{mid}" if username else ""
@@ -82,12 +86,17 @@ async def on_startup():
     await client.start()
     await resolve_entities()
 
-    @client.on(events.NewMessage(chats=lambda _: entities_cache))
+    # ВАЖНО: без параметра chats — отфильтруем вручную по allowed_chat_ids
+    @client.on(events.NewMessage)
     async def handler(event):
         try:
+            if allowed_chat_ids is not None and event.chat_id not in allowed_chat_ids:
+                return
+
             text = event.message.message or ""
             if not looks_like_request(text):
                 return
+
             chat = await event.get_chat()
             username = getattr(chat, "username", None)
             title = getattr(chat, "title", username) or str(getattr(chat, "id", ""))
@@ -100,14 +109,11 @@ async def on_startup():
                 f"🔗 {link or '(приватный чат)'}\n\n"
                 f"{norm(text)}"
             )
-            # отправим в «Избранное» (Saved Messages)
             await client.send_message("me", msg)
             logger.info(f"[MATCH] {title} #{event.id} | {norm(text)[:120]}")
-
         except Exception as e:
             logger.exception(f"Ошибка обработчика: {e}")
 
-    # держим соединение с Telegram в фоне
     asyncio.create_task(client.run_until_disconnected())
     logger.info("Клиент Telegram запущен.")
 
